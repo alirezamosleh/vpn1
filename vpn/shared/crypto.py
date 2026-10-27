@@ -1,7 +1,10 @@
 """
-رمزنگاری اشتراکی سرور و کلاینت — بدون وابستگی به کتابخانه خارجی.
+رمزنگاری اشتراکی سرور و کلاینت — بدون وابستگی اجباری به کتابخانه خارجی.
 
-- رمزنگار: ChaCha20-Poly1305 (RFC 8439، پیاده‌سازی خالص پایتون)
+- رمزنگار: ChaCha20-Poly1305 (RFC 8439)
+    * اگر کتابخانه `cryptography` نصب باشد، از پیاده‌سازی C آن استفاده می‌شود
+      (سریع‌تر؛ برای تانل با ترافیک بالا مهم است).
+    * در غیر این صورت، پیاده‌سازی خالص پایتون به‌کار می‌رود.
 - تبادل کلید: X25519 (Curve25519) با ECDH + HKDF-SHA256
 - هر بسته یک Nonce یکتا دارد (counter) => replay با Poly1305 رد می‌شود
 """
@@ -10,6 +13,17 @@ import hashlib
 import hmac
 import os
 import struct
+
+# شتاب‌دهنده اختیاری (cryptography) --------------------------------------
+try:  # pragma: no cover
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey, X25519PublicKey)
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+    _HAVE_CRYPTO = True
+except ImportError:  # pragma: no cover
+    _HAVE_CRYPTO = False
 
 # ---------------------------------------------------------------------------
 # ChaCha20-Poly1305 (RFC 8439)
@@ -84,6 +98,8 @@ def _pad16(data):
 
 
 def aead_encrypt(key, nonce, plaintext, aad=b''):
+    if _HAVE_CRYPTO:
+        return ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
     otk = _chacha20_block(key, 0, nonce)[:32]
     ct = chacha20_xor(key, nonce, plaintext, counter=1)
     mac_data = (_pad16(aad) + _pad16(ct) +
@@ -93,6 +109,13 @@ def aead_encrypt(key, nonce, plaintext, aad=b''):
 
 
 def aead_decrypt(key, nonce, ciphertext_with_tag, aad=b''):
+    if _HAVE_CRYPTO:
+        # در صورت عدم تطابق tag، cryptography خودشان InvalidTag می‌دهد؛
+        # آن را به ValueError تبدیل می‌کنیم تا لایه‌های بالاتر یکسان رفتار کنند.
+        try:
+            return ChaCha20Poly1305(key).decrypt(nonce, ciphertext_with_tag, aad)
+        except Exception as e:
+            raise ValueError(str(e))
     ct, tag = ciphertext_with_tag[:-16], ciphertext_with_tag[-16:]
     otk = _chacha20_block(key, 0, nonce)[:32]
     mac_data = (_pad16(aad) + _pad16(ct) +
@@ -157,14 +180,23 @@ def _scalarmult_x25519(u_bytes, k_bytes):
 
 
 def x25519_base(priv):
+    if _HAVE_CRYPTO:
+        return X25519PrivateKey.from_private_bytes(priv).public_key().public_bytes_raw()
     return _scalarmult_x25519(b'\x09' + b'\x00' * 31, priv)
 
 
 def x25519(priv, pub):
+    if _HAVE_CRYPTO:
+        return X25519PrivateKey.from_private_bytes(priv).exchange(
+            X25519PublicKey.from_public_bytes(pub))
     return _scalarmult_x25519(pub, priv)
 
 
 def generate_keypair():
+    if _HAVE_CRYPTO:
+        priv = X25519PrivateKey.generate()
+        return (priv.private_bytes_raw(),
+                priv.public_key().public_bytes_raw())
     priv = bytearray(os.urandom(32))
     priv[0] &= 248
     priv[31] &= 127
@@ -178,6 +210,9 @@ def generate_keypair():
 # ---------------------------------------------------------------------------
 
 def hkdf(ikm, salt=b'', info=b'myvpn-session', length=64):
+    if _HAVE_CRYPTO:
+        return HKDF(algorithm=hashes.SHA256(), length=length,
+                    salt=salt or None, info=info).derive(ikm)
     prk = hmac.new(salt or b'\x00' * 32, ikm, hashlib.sha256).digest()
     okm = b''
     t = b''
@@ -190,29 +225,55 @@ def hkdf(ikm, salt=b'', info=b'myvpn-session', length=64):
 
 
 class SessionCrypto:
-    """رمزنگار یک نشست: بعد از handshake، هر جهت با کلید خودش."""
+    """رمزنگار یک نشست: بعد از handshake، هر جهت با کلید خودش.
 
-    def __init__(self, shared_secret, our_role='client'):
-        material = hkdf(shared_secret, info=b'myvpn-v1-' + our_role.encode())
-        self.send_key = material[:32]
-        self.recv_key = material[32:64]
+    توجه مهم (نسخه قبل): هر دو طرف از یک shared secret و صرفاً با تفاوت
+    `info` در HKDF کلید می‌ساختند؛ چون شمارنده nonce در هر جهت از صفر شروع
+    می‌شد، اگر پیام client و server هم‌اندازه و هم‌شمارنده می‌بودند، keystream
+    یکسان تولید شده و XOR آن‌ها افشا می‌کرد. اینجا با salt تصادفی exchanged
+    در handshake این مشکل حل شده و کلیدهای چهار جهت (c2s/s2c برای هر طرف)
+    کاملاً مستقل‌اند.
+    """
+
+    def __init__(self, shared_secret, salt_c2s, salt_s2c):
+        k_c2s = hkdf(shared_secret, salt=salt_c2s,
+                     info=b'myvpn-v1-client-to-server')[:32]
+        k_s2c = hkdf(shared_secret, salt=salt_s2c,
+                     info=b'myvpn-v1-server-to-client')[:32]
+        self.is_server = False
+        # نقش بعداً با set_role تعیین می‌شود
+        self._k_c2s, self._k_s2c = k_c2s, k_s2c
+        self.send_key = None
+        self.recv_key = None
         self.send_counter = 0
         self._recv_seen_max = -1
+
+    def set_role(self, role):
+        """role: 'client' یا 'server'."""
+        self.is_server = (role == 'server')
+        self.send_key = self._k_s2c if self.is_server else self._k_c2s
+        self.recv_key = self._k_c2s if self.is_server else self._k_s2c
+        return self
 
     @staticmethod
     def _nonce(counter):
         return counter.to_bytes(12, 'little')
 
     def encrypt(self, plaintext, aad=b''):
+        if self.send_counter >= (1 << 64) - 1:
+            raise ValueError("nonce space exhausted; re-handshake required")
         n = self.send_counter
         self.send_counter += 1
         ct = aead_encrypt(self.send_key, self._nonce(n), plaintext, aad)
         return struct.pack('<Q', n) + ct  # 8 بایت counter + ciphertext+tag
 
     def decrypt(self, packet, aad=b''):
+        if len(packet) < 8 + 16:
+            raise ValueError("truncated packet")
         counter = struct.unpack('<Q', packet[:8])[0]
         pt = aead_decrypt(self.recv_key, self._nonce(counter),
                           packet[8:], aad)
+        # پنجره replay: بسته‌های با شمارنده خیلی قدیمی یا تکراری رد می‌شوند.
         if counter <= self._recv_seen_max - 64:
             raise ValueError("replay detected")
         if counter > self._recv_seen_max:

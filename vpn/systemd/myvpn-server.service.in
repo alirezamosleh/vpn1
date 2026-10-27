@@ -1,0 +1,24 @@
+[Unit]
+Description=MyVPN custom-protocol server (port 8585)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=-/etc/myvpn.env
+ExecStart=/usr/bin/env python3 __INSTALL_DIR__/server/server.py \
+    --port ${MYVPN_PORT} \
+    --secret "${MYVPN_SECRET}" \
+    --mode ${MYVPN_MODE} \
+    --status-file /var/lib/myvpn/status.json \
+    $MYVPN_EXTRA_ARGS
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/myvpn
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -26,7 +26,11 @@ AUTH_OK = 0x04
 DATA = 0x05
 PING = 0x06
 PONG = 0x07
+SERVER_INFO = 0x08   # اطلاعات geo سرور (رمزنگاری‌شده بعد از احراز هویت)
 ERROR = 0xFF
+
+# انواع پیام داخلی روی کانال DATA (حالت proxy)
+OPEN, OPEN_OK, WRITE, CLOSE, ERROR_STREAM = 1, 2, 3, 4, 5
 
 MAX_PAYLOAD = 65535
 

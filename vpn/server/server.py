@@ -1,24 +1,41 @@
 """
-سرور MyVPN — دو حالت:
+سرور MyVPN — روی پورت 8585 اجرا می‌شود (قابل تغییر با --port).
 
-1) حالت TUN (پیش‌فرض): تانل IP کامل با TUN device.
-   - ترافیک کلاینت از eth0 با NAT (masquerade) به بیرون می‌رود.
-2) حالت PROXY (ساده، بدون نیاز به root/TUN):
-   - سرور روی پورت VPN گوش می‌دهد؛ کلاینت بعد از اتصال، یک SOCKS5
-     محلی روی 127.0.0.1:1080 بالا می‌آورد که ترافیکش از سرور خارج می‌شود.
+دو حالت:
+
+1) حالت PROXY (پیش‌فرض، بدون نیاز به root روی کلاینت):
+   - ترافیک از طریق تانل رمزنگاری‌شده عبور می‌کند و از سرور به مقصد می‌رود.
+   - محدودیت دسترسی: فقط portهای وب (80, 443, 8080, 8443) — قابل تغییر با
+     --allow-all-ports. این کار ریسک abuse سرور را کم می‌کند.
+
+2) حالت TUN (تانل IP کامل، نیازمند root روی سرور):
+   - برای هر کلاینت یک دستگاه TUN ساخته می‌شود؛ NAT/masquerade برقرار شده
+     و مسیر پیش‌فرض کلاینت از تانل عبور می‌کند.
+
+قابلیت‌های Geo:
+   - هنگام استارت، کشور/شهر/IP عمومی سرور از سرویس‌های Geo شناسایی و در
+     status.json ذخیره می‌شود تا کلاینت‌ها (و اسکریپت‌های مانیتورینگ) بخوانند.
+   - بعد از احراز هویت، همین اطلاعات به‌صورت رمزنگاری‌شده برای کلاینت ارسال
+     می‌شود (فریم SERVER_INFO) تا بداند ترافیکش از کدام کشور خارج خواهد شد.
+   - اگر کشور سرور جزو لیست ممنوعه باشد (مثلاً IR) هشدار لاگ می‌شود؛
+     --strict-geo باعث می‌شود در آن حالت اتصال اصلاً پذیرفته نشود.
 
 اجرا:
-    python3 server.py --secret "CODE" [--port 8443] [--mode proxy|tun]
+    python3 server.py --secret "CODE" [--port 8585] [--mode proxy|tun]
+                      [--allow-all-ports] [--strict-geo] [--status-file PATH]
 
 نکته امنیتی: کد سکرت هرگز روی سیم رد و بدل نمی‌شود؛ فقط اثبات
-knowledge (SHA-256 زنجیره‌ای روی nonceها) فرستاده می‌شود.
+knowledge (SHA-256 زنجیره‌ای روی nonceها و کلیدهای public) فرستاده می‌شود.
 """
 
 import argparse
 import hashlib
 import hmac
+import ipaddress
+import json
 import os
 import selectors
+import signal
 import socket
 import struct
 import subprocess
@@ -27,10 +44,14 @@ import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from shared import crypto, proto  # noqa: E402
+from shared import crypto, proto, geoip  # noqa: E402
 
-DEFAULT_PORT = 8443
-SESSION_TTL = 30  # ثانیه بی‌فعالیت تا قطع
+DEFAULT_PORT = 8585
+SESSION_TTL = 30          # ثانیه بی‌فعالیت تا قطع نگه‌داشتن handshake
+IDLE_TIMEOUT = 180        # حداکثر بی‌کاری کانال authenticated قبل از قطع
+ALLOWED_PROXY_PORTS = {80, 443, 8080, 8443}
+GEO_REFRESH_SECS = 6 * 3600
+BLOCKED_GEO_CC = {"IR"}   # کشورهایی که خروج از آن‌ها بی‌فایده/خطرناک است
 
 
 def log(*a):
@@ -44,7 +65,7 @@ def log(*a):
 def secret_proof(secret, client_nonce, server_nonce, pub_c, pub_s):
     """اثبات کد سکرت بدون ارسال خودش."""
     h = hashlib.sha256()
-    h.update(b'myvpn-auth-v1|')
+    h.update(b'myvpn-auth-v2|')
     h.update(secret.encode())
     h.update(client_nonce)
     h.update(server_nonce)
@@ -53,84 +74,124 @@ def secret_proof(secret, client_nonce, server_nonce, pub_c, pub_s):
     return h.digest()
 
 
-def do_handshake_server(sock, secret):
-    """انجام handshake سمت سرور. در موفقیت SessionCrypto برمی‌گرداند."""
+class HandshakeError(Exception):
+    pass
+
+
+def do_handshake_server(sock, secret, geo_info=None):
+    """انجام handshake سمت سرور. در موفقیت (SessionCrypto, server_info)
+    برمی‌گرداند؛ در خطا HandshakeError."""
     reader = proto.FrameReader()
 
-    def recv_frame():
+    def recv_frame(timeout=15):
+        end = time.time() + timeout
         while True:
             f = reader.next_frame()
             if f:
                 return f
-            data = sock.recv(4096)
+            if time.time() > end:
+                raise HandshakeError("handshake timeout")
+            try:
+                sock.settimeout(max(0.5, end - time.time()))
+                data = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                raise HandshakeError("closed during handshake")
             if not data:
-                raise ConnectionError("closed during handshake")
+                raise HandshakeError("closed during handshake")
             reader.feed(data)
 
     mtype, payload = recv_frame()
     if mtype != proto.HELLO or len(payload) < 32 + 16:
-        sock.sendall(proto.pack(proto.ERROR, b'bad hello'))
-        return None
+        raise HandshakeError("bad hello")
     client_pub = payload[:32]
     client_nonce = payload[32:48]
 
     priv_s, pub_s = crypto.generate_keypair()
     server_nonce = os.urandom(16)
-    sock.sendall(proto.pack(proto.KEYSHARE, pub_s + server_nonce))
+    salt_c2s = os.urandom(16)
+    salt_s2c = os.urandom(16)
+    sock.sendall(proto.pack(proto.KEYSHARE,
+                            pub_s + server_nonce + salt_c2s + salt_s2c))
 
     mtype, payload = recv_frame()
     if mtype != proto.AUTH or len(payload) < 32 + 32:
-        sock.sendall(proto.pack(proto.ERROR, b'bad auth'))
-        return None
+        raise HandshakeError("bad auth")
     client_eph_pub = payload[:32]
     proof = payload[32:64]
 
     expected = secret_proof(secret, client_nonce, server_nonce,
                             client_pub, pub_s)
     if not hmac.compare_digest(expected, proof):
-        log("AUTH failed from", sock.getpeername())
-        sock.sendall(proto.pack(proto.ERROR, b'bad secret'))
-        return None
+        raise HandshakeError("auth failed (bad secret)")
 
     shared = crypto.x25519(priv_s, client_eph_pub)
-    sess = crypto.SessionCrypto(shared, our_role='server')
-    # یک پیام تأیید رمزنگاری‌شده بفرست تا کلاینت مطمئن شود سرور هم کلید دارد
-    ok_payload = sess.encrypt(b'AUTH_OK')
-    sock.sendall(proto.pack(proto.AUTH_OK, ok_payload))
-    return sess
+    sess = crypto.SessionCrypto(shared, salt_c2s, salt_s2c).set_role('server')
+
+    # پیام تأیید رمزنگاری‌شده + اطلاعات geo سرور (فقط بعد از احراز هویت،
+    # تا لو نرود چه کسی/کجا سرور را اجرا می‌کند)
+    sock.sendall(proto.pack(proto.AUTH_OK, sess.encrypt(b'AUTH_OK')))
+
+    info = dict(geo_info or {})
+    info['server_time'] = int(time.time())
+    sock.sendall(proto.pack(proto.SERVER_INFO,
+                            sess.encrypt(json.dumps(info).encode())))
+    return sess, info
 
 
 # ---------------------------------------------------------------------------
-# حالت PROXY: کانال DATA <-> سوکت مقصد محلی (بدون TUN)
+# ابزار: آیا مقصد مجاز است؟ (ضد abuse / SSRF به شبکه داخلی)
+# ---------------------------------------------------------------------------
+
+def host_is_public(host):
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # نام دامنه: تبدیل کن و بعد بررسی کن
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET)
+            ip = ipaddress.ip_address(infos[0][4][0])
+        except Exception:
+            return False
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_reserved or ip.is_multicast)
+
+
+# ---------------------------------------------------------------------------
+# حالت PROXY: کانال DATA <-> سوکت مقصد (پروتکل داخلی multiplex)
 # ---------------------------------------------------------------------------
 
 class ProxyServer:
     """
     پروتکل داخلی روی کانال رمزنگاری‌شده:
-        [1 بایت نوع][payload]
-        نوع 1: OPEN  -> host_len(1) host port(2) req_id(4)
-        نوع 2: OPEN_OK -> req_id(4)
-        نوع 3: WRITE -> req_id(4) data
-        نوع 4: CLOSE -> req_id(4)
+        نوع proto.OPEN : host_len(1) host port(2) req_id(4)
+        نوع proto.OPEN_OK : req_id(4)
+        نوع proto.WRITE : req_id(4) data
+        نوع proto.CLOSE : req_id(4)
+        نوع proto.ERROR_STREAM: req_id(4) reason_len(1) reason
     """
-    OPEN, OPEN_OK, WRITE, CLOSE = 1, 2, 3, 4
 
-    def __init__(self, sess, sock, peer):
+    def __init__(self, sess, sock, peer, allow_all_ports=False):
         self.sess = sess
         self.sock = sock
         self.peer = peer
-        self.streams = {}  # req_id -> socket
+        self.allow_all_ports = allow_all_ports
+        self.streams = {}      # req_id -> socket
         self.lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        self.last_activity = time.time()
 
     def _send(self, inner):
         try:
-            self.sock.sendall(proto.pack(proto.DATA, self.sess.encrypt(inner)))
+            with self.send_lock:
+                self.sock.sendall(
+                    proto.pack(proto.DATA, self.sess.encrypt(inner)))
         except OSError:
             pass
 
     def handle(self):
         reader = proto.FrameReader()
-        last = time.time()
         while True:
             try:
                 data = self.sock.recv(65536)
@@ -138,7 +199,7 @@ class ProxyServer:
                 break
             if not data:
                 break
-            last = time.time()
+            self.last_activity = time.time()
             reader.feed(data)
             while True:
                 f = reader.next_frame()
@@ -146,52 +207,75 @@ class ProxyServer:
                     break
                 mtype, payload = f
                 if mtype == proto.PING:
-                    self.sock.sendall(proto.pack(proto.PONG))
+                    try:
+                        self.sock.sendall(proto.pack(proto.PONG))
+                    except OSError:
+                        return
                     continue
                 if mtype != proto.DATA:
                     continue
                 try:
                     inner = self.sess.decrypt(payload)
                 except ValueError:
-                    log("bad frame from", self.peer, "- dropping")
+                    log("bad frame from", self.peer, "- closing session")
                     return
                 self._dispatch(inner)
-            if time.time() - last > SESSION_TTL * 6:
+            if time.time() - self.last_activity > IDLE_TIMEOUT:
+                log("idle timeout:", self.peer)
                 break
+        self._close_all()
 
     def _dispatch(self, inner):
+        if not inner:
+            return
         kind = inner[0]
         body = inner[1:]
-        if kind == self.OPEN:
+        if kind == proto.OPEN:
+            if len(body) < 7:
+                return
             hlen = body[0]
             host = body[1:1 + hlen].decode('utf-8', 'replace')
             port = struct.unpack('>H', body[1 + hlen:3 + hlen])[0]
             req_id = struct.unpack('>I', body[3 + hlen:7 + hlen])[0]
-            try:
-                remote = socket.create_connection((host, port), timeout=10)
-                remote.setblocking(False)
-                with self.lock:
-                    self.streams[req_id] = remote
-                self._send(struct.pack('>BI', self.OPEN_OK, req_id))
-                threading.Thread(target=self._pump_remote,
-                                 args=(req_id, remote), daemon=True).start()
-            except OSError as e:
-                # خطا را با CLOSE اعلام می‌کنیم
-                self._send(struct.pack('>BI', self.CLOSE, req_id))
+            self._open_stream(req_id, host, port)
 
-        elif kind == self.WRITE:
+        elif kind == proto.WRITE:
             req_id = struct.unpack('>I', body[:4])[0]
             chunk = body[4:]
             remote = self.streams.get(req_id)
             if remote:
+                self.last_activity = time.time()
                 try:
                     remote.sendall(chunk)
                 except OSError:
                     self._close_stream(req_id)
 
-        elif kind == self.CLOSE:
+        elif kind == proto.CLOSE:
             req_id = struct.unpack('>I', body[:4])[0]
             self._close_stream(req_id)
+
+    def _deny(self, req_id, reason):
+        b = reason.encode()[:200]
+        self._send(bytes([proto.ERROR_STREAM]) +
+                   struct.pack('>I', req_id) + bytes([len(b)]) + b)
+
+    def _open_stream(self, req_id, host, port):
+        if not self.allow_all_ports and port not in ALLOWED_PROXY_PORTS:
+            self._deny(req_id, f"port {port} not allowed")
+            return
+        if not host_is_public(host):
+            self._deny(req_id, "private/reserved destination refused")
+            return
+        try:
+            remote = socket.create_connection((host, port), timeout=10)
+            remote.setblocking(False)
+            with self.lock:
+                self.streams[req_id] = remote
+            self._send(struct.pack('>BI', proto.OPEN_OK, req_id))
+            threading.Thread(target=self._pump_remote,
+                             args=(req_id, remote), daemon=True).start()
+        except OSError as e:
+            self._deny(req_id, f"connect failed: {e}")
 
     def _close_stream(self, req_id):
         with self.lock:
@@ -201,6 +285,12 @@ class ProxyServer:
                 r.close()
             except OSError:
                 pass
+
+    def _close_all(self):
+        with self.lock:
+            ids = list(self.streams)
+        for rid in ids:
+            self._close_stream(rid)
 
     def _pump_remote(self, req_id, remote):
         sel = selectors.DefaultSelector()
@@ -212,82 +302,139 @@ class ProxyServer:
                     continue
                 try:
                     chunk = remote.recv(32768)
-                except OSError:
+                except (OSError, BlockingIOError):
                     chunk = b''
                 if not chunk:
-                    self._send(struct.pack('>BI', self.CLOSE, req_id))
+                    self._send(struct.pack('>BI', proto.CLOSE, req_id))
                     self._close_stream(req_id)
                     return
-                # قطعه‌بندی برای ماندن زیر MAX_PAYLOAD
+                self.last_activity = time.time()
+                # قطعه‌بندی برای ماندن زیر MAX_PAYLOAD (سربسته AEAD ۲۴ بایت)
                 for i in range(0, len(chunk), 16000):
                     part = chunk[i:i + 16000]
-                    self._send(struct.pack('>BI', self.WRITE, req_id) + part)
+                    self._send(struct.pack('>BI', proto.WRITE, req_id) + part)
         finally:
             sel.close()
 
 
 # ---------------------------------------------------------------------------
-# حلقه اصلی سرور (selector، چند کلاینت همزمان)
+# حلقه اصلی سرور (چند کلاینت همزمان)
 # ---------------------------------------------------------------------------
 
 class Server:
-    def __init__(self, port, secret, mode):
+    def __init__(self, port, secret, mode, allow_all_ports=False,
+                 strict_geo=False, status_file=None):
         self.port = port
         self.secret = secret
         self.mode = mode
-        self.clients = {}  # fd -> (sock, peer, ProxyServer|None, thread)
+        self.allow_all_ports = allow_all_ports
+        self.strict_geo = strict_geo
+        self.status_file = status_file or os.path.join(
+            os.path.dirname(__file__), '..', 'status.json')
+        self.geo_info = None
+        self._tun_counter = 0
+        self._tun_lock = threading.Lock()
 
+    # ---------------- geo ----------------
+    def refresh_geo(self):
+        info = geoip.get_geo()
+        if info:
+            self.geo_info = info
+            log("server geo:", geoip.geo_summary(info))
+            if info.get('cc') in BLOCKED_GEO_CC:
+                log("⚠️  WARNING: exit country is in blocked list "
+                    f"({info['cc']}) — VPN likely useless from same region!")
+        else:
+            log("geo lookup failed (offline?) - continuing without geo")
+        self._write_status()
+
+    def _write_status(self):
+        status = {
+            "updated": time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+            "port": self.port,
+            "mode": self.mode,
+            "geo": self.geo_info,
+        }
+        geoip.write_status(self.status_file, status)
+
+    def _geo_refresher(self):
+        while True:
+            time.sleep(GEO_REFRESH_SECS)
+            try:
+                self.refresh_geo()
+            except Exception as e:
+                log("geo refresh error:", e)
+
+    # ---------------- run ----------------
     def run(self):
+        self.refresh_geo()
+        threading.Thread(target=self._geo_refresher, daemon=True).start()
+
         lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         lsock.bind(('0.0.0.0', self.port))
-        lsock.listen(16)
+        lsock.listen(32)
         log(f"MyVPN server listening on :{self.port} (mode={self.mode})")
+        log(f"status file: {self.status_file}")
 
-        sel = selectors.DefaultSelector()
-        sel.register(lsock, selectors.EVENT_READ)
+        stop = threading.Event()
 
-        while True:
-            for key, _ in sel.select(1):
-                if key.fd == lsock.fileno():
-                    self._accept(lsock, sel)
-                else:
-                    # در حالت proxy هر کلاینت thread خودش را دارد؛ اینجا فقط
-                    # handshake اولیه در تhread انجام می‌شود
-                    pass
-
-    def _accept(self, lsock, sel):
-        conn, addr = lsock.accept()
-        conn.settimeout(15)
-        log("connection from", addr)
-
-        def serve():
+        def on_sig(*_):
+            stop.set()
             try:
-                sess = do_handshake_server(conn, self.secret)
-                if sess is None:
-                    conn.close()
-                    return
-                log("client authenticated:", addr)
-                if self.mode == 'proxy':
-                    ps = ProxyServer(sess, conn, addr)
-                    ps.handle()
-                else:
-                    self._serve_tun(sess, conn, addr)
-            except Exception as e:
-                log("client error:", e)
-            finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                lsock.close()
+            except OSError:
+                pass
+        signal.signal(signal.SIGTERM, on_sig)
+        signal.signal(signal.SIGINT, on_sig)
 
-        threading.Thread(target=serve, daemon=True).start()
+        while not stop.is_set():
+            try:
+                conn, addr = lsock.accept()
+            except OSError:
+                break
+            conn.settimeout(15)
+            threading.Thread(target=self._serve_client,
+                             args=(conn, addr), daemon=True).start()
+
+        log("server stopped")
+
+    def _serve_client(self, conn, addr):
+        try:
+            sess, info = do_handshake_server(conn, self.secret, self.geo_info)
+        except HandshakeError as e:
+            log("handshake refused from", addr, "-", e)
+            try:
+                conn.sendall(proto.pack(proto.ERROR, str(e).encode()[:100]))
+            except OSError:
+                pass
+            conn.close()
+            return
+        cc = (info or {}).get('cc', '??')
+        log(f"client authenticated: {addr} -> exit {cc}")
+        if self.strict_geo and cc in BLOCKED_GEO_CC:
+            log("strict-geo: refusing to route through blocked country")
+            conn.close()
+            return
+        try:
+            if self.mode == 'proxy':
+                ps = ProxyServer(sess, conn, addr, self.allow_all_ports)
+                ps.handle()
+            else:
+                self._serve_tun(sess, conn, addr)
+        except Exception as e:
+            log("client error:", e)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     # ------------------- حالت TUN -------------------
-    def _open_tun(self, name, ip):
-        cmd = ['ip', 'tuntap', 'add', 'dev', name, 'mode', 'tun']
-        subprocess.run(cmd, check=False)
-        subprocess.run(['ip', 'addr', 'add', ip + '/24', 'dev', name],
+    def _open_tun(self, name, ip_cidr):
+        subprocess.run(['ip', 'tuntap', 'add', 'dev', name, 'mode', 'tun'],
+                       check=False)
+        subprocess.run(['ip', 'addr', 'add', ip_cidr, 'dev', name],
                        check=False)
         subprocess.run(['ip', 'link', 'set', name, 'up'], check=False)
         TUNSETIFF = 0x400454ca
@@ -298,33 +445,40 @@ class Server:
         fcntl.ioctl(fd, TUNSETIFF, ifr)
         return fd
 
-    def _setup_nat(self, tun_ip_cidr, ext_if):
-        net = tun_ip_cidr  # e.g. 10.66.0.0/24
+    def _setup_nat(self, tun_net_cidr, tun_name, ext_if):
         subprocess.run(['iptables', '-t', 'nat', '-A', 'POSTROUTING',
-                        '-s', net, '-o', ext_if, '-j', 'MASQUERADE'],
+                        '-s', tun_net_cidr, '-o', ext_if, '-j', 'MASQUERADE'],
                        check=False)
-        subprocess.run(['iptables', '-A', 'FORWARD', '-i', 'myvpn0',
+        subprocess.run(['iptables', '-A', 'FORWARD', '-i', tun_name,
                         '-j', 'ACCEPT'], check=False)
-        subprocess.run(['iptables', '-A', 'FORWARD', '-o', 'myvpn0',
+        subprocess.run(['iptables', '-A', 'FORWARD', '-o', tun_name,
                         '-j', 'ACCEPT'], check=False)
-        with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
-            f.write('1')
+        try:
+            with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
+                f.write('1')
+        except OSError:
+            log("cannot enable ip_forward (not root?)")
 
     def _serve_tun(self, sess, conn, addr):
-        # یک TUN به ازای هر کلاینت (ساده‌سازی: شماره‌گذاری)
-        Server._tun_counter = getattr(Server, '_tun_counter', 0) + 1
-        n = Server._tun_counter
+        with self._tun_lock:
+            self._tun_counter += 1
+            n = self._tun_counter
         name = f'myvpn{n}'
         client_ip = f'10.66.{n}.2'
         server_ip = f'10.66.{n}.1'
-        fd = self._open_tun(name, server_ip)
-        self._setup_nat(f'10.66.{n}.0/24', self._guess_ext_if())
-        log(f"TUN {name} up; client route: give {client_ip} to peer via push")
+        fd = self._open_tun(name, f'{server_ip}/24')
+        self._setup_nat(f'10.66.{n}.0/24', name, self._guess_ext_if())
+        log(f"TUN {name} up; client ip {client_ip}")
 
-        # ارسال تنظیمات به کلاینت (به صورت encrypt)
-        cfg = json_dumps({'client_ip': client_ip, 'server_ip': server_ip,
+        send_lock = threading.Lock()
+
+        def send_raw(inner):
+            with send_lock:
+                conn.sendall(proto.pack(proto.DATA, sess.encrypt(inner)))
+
+        cfg = json.dumps({'client_ip': client_ip, 'server_ip': server_ip,
                           'dns': '1.1.1.1'}).encode()
-        conn.sendall(proto.pack(proto.DATA, sess.encrypt(b'CFG' + cfg)))
+        send_raw(b'\x06CFG' + cfg)   # نوع داخلی 6 = CONFIG
 
         import fcntl
         fl = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -343,8 +497,7 @@ class Server:
                         continue
                     if pkt:
                         try:
-                            conn.sendall(proto.pack(
-                                proto.DATA, sess.encrypt(pkt)))
+                            send_raw(pkt)   # بدون پیشوند => مستقیم IP packet
                         except OSError:
                             break
             sel.close()
@@ -371,7 +524,7 @@ class Server:
                             pt = sess.decrypt(payload)
                         except ValueError:
                             continue
-                        if pt.startswith(b'CFG'):
+                        if pt.startswith(b'\x06'):
                             continue
                         try:
                             os.write(fd, pt)
@@ -381,6 +534,9 @@ class Server:
             stop.set()
             t.join(timeout=2)
             os.close(fd)
+            subprocess.run(['ip', 'link', 'set', name, 'down'], check=False)
+            subprocess.run(['ip', 'tuntap', 'del', 'dev', name, 'mode', 'tun'],
+                           check=False)
 
     @staticmethod
     def _guess_ext_if():
@@ -392,19 +548,23 @@ class Server:
             return 'eth0'
 
 
-def json_dumps(d):
-    import json
-    return json.dumps(d)
-
-
 def main():
     ap = argparse.ArgumentParser(description='MyVPN custom server')
     ap.add_argument('--port', type=int, default=DEFAULT_PORT)
     ap.add_argument('--secret', required=True, help='کد سکرت مشترک')
     ap.add_argument('--mode', choices=['proxy', 'tun'], default='proxy')
+    ap.add_argument('--allow-all-ports', action='store_true',
+                    help='در حالت proxy همه portها مجاز باشند (پیش‌فرض: فقط وب)')
+    ap.add_argument('--strict-geo', action='store_true',
+                    help='اگر کشور سرور جزو لیست ممنوعه بود، اتصال نپذیر')
+    ap.add_argument('--status-file', default=None,
+                    help='مسیر فایل status.json (پیش‌فرض کنار سورس)')
     args = ap.parse_args()
 
-    s = Server(args.port, args.secret, args.mode)
+    s = Server(args.port, args.secret, args.mode,
+               allow_all_ports=args.allow_all_ports,
+               strict_geo=args.strict_geo,
+               status_file=args.status_file)
     try:
         s.run()
     except KeyboardInterrupt:
