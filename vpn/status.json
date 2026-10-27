@@ -1,0 +1,14 @@
+{
+  "updated": "2026-10-27T19:50:20+0000",
+  "port": 8585,
+  "mode": "proxy",
+  "geo": {
+    "source": "ip-api.com",
+    "country": "Singapore",
+    "cc": "SG",
+    "city": "Singapore",
+    "lat": 1.35208,
+    "lon": 103.82,
+    "ip": "47.236.207.165"
+  }
+}
